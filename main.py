@@ -1,5 +1,8 @@
 from fastapi import FastAPI, HTTPException, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict, model_validator
+
+from knowledge_api.db import SessionLocal, NoteDB
+from sqlalchemy import select, or_
 
 app = FastAPI(title="Knowledge API", version="0.1.0")
 
@@ -10,14 +13,18 @@ class NoteIn(BaseModel):
   pinned: bool = False
 
 class Note(NoteIn):
+  model_config = ConfigDict(from_attributes=True)
+
   id: int
 
-notes: list[Note] = [
-  Note(id=1, title="Python", tags=["python", "ml"], pinned=False),
-  Note(id=2, title="FastAPI", tags=["python"], pinned=True),
-  Note(id=3, title="RAG", tags=["ml", "ai"], pinned=True),
-  Note(id=4, title="Vue", tags=["frontend"], pinned=False),
-]
+def note_to_schema(item: NoteDB) -> Note:
+  return Note(
+    id=item.id,
+    title=item.title,
+    content=item.content,
+    pinned=item.pinned,
+    tags=item.tags
+  )
 
 @app.get("/health")
 def health() -> dict:
@@ -29,71 +36,118 @@ def list_notes(
     tag: str | None = None,
     sort: str = "created"
 ) -> list[Note]:
-  result = notes.copy()
+  stmt = select(NoteDB)
 
-  if search is not None:
-    result = [
-      n for n in result
-      if search.lower() in (n.title + " " + n.content).lower()
-   ]
-
-  if tag is not None:
-    result = [ n for n in result if tag in n.tags ]
+  if search:
+    stmt = stmt.where(NoteDB.title.ilike(f"%{search}%") | (NoteDB.content.ilike(f"%{search}%")))
 
   if sort == "pinned":
-    result = sorted(
-      result,
-      key=lambda n:(not n.pinned, n.id)
-    )
+    stmt = stmt.order_by(NoteDB.pinned.desc(), NoteDB.id)
+  elif sort == "created":
+    stmt = stmt.order_by(NoteDB.id)
 
-  return result
+  if tag:
+    stmt = stmt.where(NoteDB.tags.contains([tag]))
+
+  with SessionLocal() as session:
+    result = session.scalars(stmt).all()
+
+    return [ note_to_schema(r) for r in result ]
+
+
+@app.get("/notes/{note_id}")
+def get_note_by_id(note_id: int) -> Note:
+  with SessionLocal() as session:
+    item = session.get(NoteDB, note_id)
+
+    if item is None:
+      raise HTTPException(status_code=404, detail="Note not found")
+
+    return note_to_schema(item)
 
 @app.get("/notes/{note_id}/related")
 def get_related_notes(note_id: int) -> list[Note]:
-  result = []
-  found = False
+  stmt = select(NoteDB)
 
-  for note in notes:
-    if note.id == note_id:
-      note_tags = note.tags
-      found = True
-      result = [n for n in notes if n.id != note_id]
-      result = [n for n in result if set(n.tags) & set(note_tags)]
+  stmt = stmt.where(NoteDB.id != note_id)
 
-  if not found:
-    raise HTTPException(status_code=404, detail="Note not found")
+  with SessionLocal() as session:
+    item = session.get(NoteDB, note_id)
 
-  return result
+    if item is None:
+      raise HTTPException(status_code=404, detail="Note not found")
+
+    conditions = []
+
+    if not item.tags:
+      return  []
+
+    for tag in item.tags:
+      conditions.append(NoteDB.tags.contains([tag]))
+
+    stmt = stmt.where(or_(*conditions))
+
+    all_notes = session.scalars(stmt).all()
+
+    return [
+      note_to_schema(r)
+      for r in all_notes
+    ]
 
 @app.post("/notes", status_code=201, response_model=Note)
 def create_note(note: NoteIn) -> Note:
-  item = Note(
-    id = len(notes) + 1,
-    ** note.model_dump()
-  )
-  notes.append(item)
-  return item
+  with SessionLocal() as session:
+    item = NoteDB(
+      title=note.title,
+      content=note.content,
+      pinned=note.pinned,
+      tags=note.tags
+    )
+
+    session.add(item)
+    session.commit()
+    session.refresh(item)
+
+  return note_to_schema(item)
 
 @app.delete("/notes/{note_id}", status_code=204)
 def delete_note(note_id: int) -> Response:
-  for note in notes:
-    if note.id == note_id:
-      notes.remove(note)
+  with SessionLocal() as session:
+    item = session.get(NoteDB, note_id)
+    if item is not None:
+      session.delete(item)
+      session.commit()
       return Response(status_code=204)
 
   raise HTTPException(status_code=404, detail="Note not found")
 
 class NoteUpdate(BaseModel):
-  title: str | None = Field(default=None, min_length=1, max_length=200)
+  title: str | None = None
   content: str | None = None
+  tags: list[str] | None = None
+  pinned: bool | None = None
+
+  @model_validator(mode="after")
+  def reject_nulls(self):
+    for field in self.model_fields_set:
+      if getattr(self, field) is None:
+        raise ValueError(f"{field} cannot be null")
+    return self
 
 @app.patch("/notes/{note_id}")
 def update_note(note_id: int, update: NoteUpdate) -> Note:
-  for index, note in enumerate(notes):
-    if note.id == note_id:
-      changes = update.model_dump(exclude_unset=True)
-      updated_note = note.model_copy(update=changes)
-      notes[index] = updated_note
-      return updated_note
+  with SessionLocal() as session:
+    item = session.get(NoteDB, note_id)
 
-  raise HTTPException(status_code=404, detail="Note not found")
+    if item is None:
+      raise HTTPException(status_code=404, detail="Note not found")
+
+    changes = update.model_dump(exclude_unset=True)
+
+    for field, value in changes.items():
+        setattr(item, field, value)
+
+    session.commit()
+    session.refresh(item)
+
+    return note_to_schema(item)
