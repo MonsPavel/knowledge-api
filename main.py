@@ -1,21 +1,27 @@
-from fastapi import FastAPI, HTTPException, Response
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from fastapi import FastAPI, Response, Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 
 from knowledge_api.db import SessionLocal, NoteDB
 from sqlalchemy import select, or_
 
-app = FastAPI(title="Knowledge API", version="0.1.0")
+from knowledge_api.errors import AppError, NotFoundError, ConflictError
+from knowledge_api.classes.note import NoteIn, Note, NoteUpdate
+from knowledge_api.classes.errors import ProblemDetails
 
-class NoteIn(BaseModel):
-  title: str = Field(min_length=1, max_length=200)
-  content: str = ""
-  tags: list[str] = Field(default_factory=list)
-  pinned: bool = False
+import logging
+app = FastAPI(
+  title="Knowledge API",
+  version="0.1.0",
+    responses = {
+      500: {
+        "model": ProblemDetails,
+        "description": "Внутренняя ошибка сервера"
+      }
+    }
+)
 
-class Note(NoteIn):
-  model_config = ConfigDict(from_attributes=True)
-
-  id: int
+logger = logging.getLogger(__name__)
 
 def note_to_schema(item: NoteDB) -> Note:
   return Note(
@@ -26,11 +32,72 @@ def note_to_schema(item: NoteDB) -> Note:
     tags=item.tags
   )
 
+@app.exception_handler(AppError)
+def error_handler(request: Request, exc: AppError) -> Response:
+  logger.warning("%r", exc)
+
+  content = {
+    "type": exc.error_type,
+    "title": exc.title,
+    "status": exc.status,
+    "detail": exc.detail
+  }
+
+  return JSONResponse(
+    status_code = exc.status,
+    content = content,
+    media_type = "application/problem+json"
+  )
+
+@app.exception_handler(Exception)
+def exception_handler(request: Request, exc: Exception) -> Response:
+  logger.exception("Неожиданная ошибка при обработке %s", request.url.path)
+
+  content = {
+    "type": "https://knowledge-api.dev/errors/server-error",
+    "title": "Internal Server Error",
+    "status": 500,
+    "detail": "Произошла ошибка на сервере"
+  }
+
+  return JSONResponse(
+    status_code=500,
+    content=content,
+    media_type="application/problem+json"
+  )
+
+@app.exception_handler(RequestValidationError)
+def validation_error_handler(
+    request: Request,
+    exc: RequestValidationError
+) -> Response:
+    content = {
+        "type": "https://knowledge-api.dev/errors/validation",
+        "title": "Unprocessable Content",
+        "status": 422,
+        "detail": "Ошибка валидации запроса"
+    }
+
+    return JSONResponse(
+      status_code = content["status"],
+      content = content,
+      media_type = "application/problem+json"
+    )
+
 @app.get("/health")
 def health() -> dict:
   return {"status": "ok"}
 
-@app.get("/notes")
+@app.get(
+  "/notes",
+  responses= {
+    422: {
+      "model": ProblemDetails,
+      "description": "Ошибка валидации запроса"
+    }
+  }
+)
+
 def list_notes(
     search: str | None = None,
     tag: str | None = None,
@@ -55,17 +122,42 @@ def list_notes(
     return [ note_to_schema(r) for r in result ]
 
 
-@app.get("/notes/{note_id}")
+@app.get(
+  "/notes/{note_id}",
+  responses= {
+    404: {
+      "model": ProblemDetails,
+      "description": "Заметка не найдена"
+    },
+    422: {
+      "model": ProblemDetails,
+      "description": "Ошибка валидации запроса"
+    }
+  }
+)
+
 def get_note_by_id(note_id: int) -> Note:
   with SessionLocal() as session:
     item = session.get(NoteDB, note_id)
 
     if item is None:
-      raise HTTPException(status_code=404, detail="Note not found")
+      raise NotFoundError(f"Заметка {note_id} не найдена")
 
     return note_to_schema(item)
 
-@app.get("/notes/{note_id}/related")
+@app.get(
+  "/notes/{note_id}/related",
+  responses= {
+    404: {
+      "model": ProblemDetails,
+      "description": "Заметка не найдена"
+    },
+    422: {
+      "model": ProblemDetails,
+      "description": "Ошибка валидации запроса"
+    }
+  }
+)
 def get_related_notes(note_id: int) -> list[Note]:
   stmt = select(NoteDB)
 
@@ -75,7 +167,7 @@ def get_related_notes(note_id: int) -> list[Note]:
     item = session.get(NoteDB, note_id)
 
     if item is None:
-      raise HTTPException(status_code=404, detail="Note not found")
+      raise NotFoundError(f"Заметка {note_id} не найдена")
 
     conditions = []
 
@@ -94,23 +186,62 @@ def get_related_notes(note_id: int) -> list[Note]:
       for r in all_notes
     ]
 
-@app.post("/notes", status_code=201, response_model=Note)
+@app.post(
+  "/notes",
+  status_code=201,
+  response_model=Note,
+  responses= {
+    409: {
+      "model": ProblemDetails,
+      "description": "Заметка с таким названием уже существует"
+    },
+    422: {
+      "model": ProblemDetails,
+      "description": "Ошибка валидации запроса"
+    }
+  }
+)
 def create_note(note: NoteIn) -> Note:
+  stmt = select(NoteDB)
+  stmt = stmt.where(NoteDB.title == note.title)
+
   with SessionLocal() as session:
-    item = NoteDB(
-      title=note.title,
-      content=note.content,
-      pinned=note.pinned,
-      tags=note.tags
-    )
+    result = session.scalar(stmt)
 
-    session.add(item)
-    session.commit()
-    session.refresh(item)
+    if result:
+      raise ConflictError()
 
-  return note_to_schema(item)
+    else:
+      item = NoteDB(
+        title=note.title,
+        content=note.content,
+        pinned=note.pinned,
+        tags=note.tags
+      )
 
-@app.delete("/notes/{note_id}", status_code=204)
+      session.add(item)
+      session.commit()
+      session.refresh(item)
+
+      return note_to_schema(item)
+
+
+
+@app.delete(
+  "/notes/{note_id}",
+  status_code=204,
+  responses= {
+    404: {
+      "model": ProblemDetails,
+      "description": "Заметка не найдена"
+    },
+    422: {
+      "model": ProblemDetails,
+      "description": "Ошибка валидации запроса"
+    }
+  }
+)
+
 def delete_note(note_id: int) -> Response:
   with SessionLocal() as session:
     item = session.get(NoteDB, note_id)
@@ -119,28 +250,28 @@ def delete_note(note_id: int) -> Response:
       session.commit()
       return Response(status_code=204)
 
-  raise HTTPException(status_code=404, detail="Note not found")
+  raise NotFoundError(f"Заметка {note_id} не найдена")
 
-class NoteUpdate(BaseModel):
-  title: str | None = None
-  content: str | None = None
-  tags: list[str] | None = None
-  pinned: bool | None = None
+@app.patch(
+"/notes/{note_id}",
+  responses= {
+    404: {
+      "model": ProblemDetails,
+      "description": "Заметка не найдена"
+    },
+    422: {
+      "model": ProblemDetails,
+      "description": "Ошибка валидации запроса"
+    }
+  }
+)
 
-  @model_validator(mode="after")
-  def reject_nulls(self):
-    for field in self.model_fields_set:
-      if getattr(self, field) is None:
-        raise ValueError(f"{field} cannot be null")
-    return self
-
-@app.patch("/notes/{note_id}")
 def update_note(note_id: int, update: NoteUpdate) -> Note:
   with SessionLocal() as session:
     item = session.get(NoteDB, note_id)
 
     if item is None:
-      raise HTTPException(status_code=404, detail="Note not found")
+      raise NotFoundError(f"Заметка {note_id} не найдена")
 
     changes = update.model_dump(exclude_unset=True)
 
